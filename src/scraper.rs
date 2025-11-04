@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 use url::Url;
+use utoipa::ToSchema;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScraperError {
@@ -21,7 +22,7 @@ pub enum ScraperError {
     Json(#[from] serde_json::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScrapedData {
     pub url: String,
     pub title: Option<String>,
@@ -35,9 +36,11 @@ pub struct ScraperConfig {
     pub max_pages: usize,
     pub max_depth: usize,
     pub delay_ms: u64,
-    pub max_concurrent: usize,
+    #[allow(dead_code)]
+    pub max_concurrent: usize, // Reserved for future concurrent scraping implementation
     pub follow_external_links: bool,
-    pub respect_robots_txt: bool,
+    #[allow(dead_code)]
+    pub respect_robots_txt: bool, // Reserved for future robots.txt support
 }
 
 impl Default for ScraperConfig {
