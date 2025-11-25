@@ -36,12 +36,25 @@ pub struct JobSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: Uuid,
+    pub name: Option<String>,
     pub email: String,
-    pub password_hash: String,
-    pub is_paid: bool,
+    pub password_hash: Option<String>,
+    pub google_id: Option<String>,
+    pub avatar_url: Option<String>,
     pub credits: i32,
+    pub email_verified: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtpVerification {
+    pub id: Uuid,
+    pub email: String,
+    pub otp_code: String,
+    pub expires_at: DateTime<Utc>,
+    pub verified: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,19 +87,118 @@ impl Database {
         Ok(Self { pool })
     }
 
+    pub async fn create_user_with_google(
+        &self,
+        google_id: &str,
+        email: &str,
+        avatar_url: Option<&str>,
+    ) -> Result<Uuid, sqlx::Error> {
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, name, email, password_hash, google_id, avatar_url, email_verified)
+            VALUES ($1, NULL, $2, NULL, $3, $4, true)
+            "#,
+        )
+        .bind(user_id)
+        .bind(email)
+        .bind(google_id)
+        .bind(avatar_url)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(user_id)
+    }
+
+    pub async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<User>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, created_at, updated_at
+            FROM users
+            WHERE google_id = $1
+            "#,
+        )
+        .bind(google_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| User {
+            id: r.get("id"),
+            name: r.try_get("name").ok(),
+            email: r.get("email"),
+            password_hash: r.try_get("password_hash").ok(),
+            google_id: r.try_get("google_id").ok(),
+            avatar_url: r.try_get("avatar_url").ok(),
+            credits: r.get("credits"),
+            email_verified: r.get("email_verified"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    pub async fn link_google_account(
+        &self,
+        user_id: Uuid,
+        google_id: &str,
+        avatar_url: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET google_id = $2,
+                avatar_url = $3,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(google_id)
+        .bind(avatar_url)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_google_profile(
+        &self,
+        user_id: Uuid,
+        email: &str,
+        avatar_url: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET email = $2,
+                avatar_url = $3,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(email)
+        .bind(avatar_url)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn create_user(
         &self,
+        name: &str,
         email: &str,
         password_hash: &str,
     ) -> Result<Uuid, sqlx::Error> {
         let user_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO users (id, email, password_hash)
-            VALUES ($1, $2, $3)
+            INSERT INTO users (id, name, email, password_hash, google_id, avatar_url, email_verified)
+            VALUES ($1, $2, $3, $4, NULL, NULL, false)
             "#,
         )
         .bind(user_id)
+        .bind(name)
         .bind(email)
         .bind(password_hash)
         .execute(&self.pool)
@@ -95,10 +207,25 @@ impl Database {
         Ok(user_id)
     }
 
+    pub async fn verify_user_email(&self, user_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET email_verified = true, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, email, password_hash, is_paid, credits, created_at, updated_at
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, created_at, updated_at
             FROM users 
             WHERE email = $1
             "#,
@@ -109,10 +236,13 @@ impl Database {
 
         Ok(row.map(|r| User {
             id: r.get("id"),
+            name: r.try_get("name").ok(),
             email: r.get("email"),
-            password_hash: r.get("password_hash"),
-            is_paid: r.get("is_paid"),
+            password_hash: r.try_get("password_hash").ok(),
+            google_id: r.try_get("google_id").ok(),
+            avatar_url: r.try_get("avatar_url").ok(),
             credits: r.get("credits"),
+            email_verified: r.get("email_verified"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
@@ -121,7 +251,7 @@ impl Database {
     pub async fn get_user_by_id(&self, user_id: Uuid) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, email, password_hash, is_paid, credits, created_at, updated_at
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, created_at, updated_at
             FROM users 
             WHERE id = $1
             "#,
@@ -132,10 +262,13 @@ impl Database {
 
         Ok(row.map(|r| User {
             id: r.get("id"),
+            name: r.try_get("name").ok(),
             email: r.get("email"),
-            password_hash: r.get("password_hash"),
-            is_paid: r.get("is_paid"),
+            password_hash: r.try_get("password_hash").ok(),
+            google_id: r.try_get("google_id").ok(),
+            avatar_url: r.try_get("avatar_url").ok(),
             credits: r.get("credits"),
+            email_verified: r.get("email_verified"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
@@ -574,6 +707,39 @@ impl Database {
             .collect())
     }
 
+    /// Get daily credit usage (deductions) for the last 30 days
+    /// Returns a vector of (date, credits_used) tuples
+    pub async fn get_user_credit_usage_last_30_days(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<(chrono::NaiveDate, i32)>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+                DATE(created_at) as usage_date,
+                SUM(ABS(amount)) as credits_used
+            FROM credit_transactions 
+            WHERE user_id = $1
+                AND transaction_type = 'deduction'
+                AND created_at >= NOW() - INTERVAL '30 days'
+            GROUP BY DATE(created_at)
+            ORDER BY usage_date ASC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let date: chrono::NaiveDate = r.get("usage_date");
+                let credits: i64 = r.get("credits_used");
+                (date, credits as i32)
+            })
+            .collect())
+    }
+
     pub async fn delete_job(&self, job_id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM jobs WHERE id = $1")
             .bind(job_id)
@@ -762,6 +928,98 @@ impl Database {
             "#,
         )
         .bind(days)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    // OTP verification operations
+    pub async fn create_otp(
+        &self,
+        email: &str,
+        otp_code: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, sqlx::Error> {
+        // Invalidate any existing unverified OTPs for this email
+        sqlx::query(
+            r#"
+            UPDATE otp_verifications
+            SET verified = true
+            WHERE email = $1 AND verified = false AND expires_at > NOW()
+            "#,
+        )
+        .bind(email)
+        .execute(&self.pool)
+        .await?;
+
+        // Create new OTP
+        let otp_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO otp_verifications (id, email, otp_code, expires_at, verified)
+            VALUES ($1, $2, $3, $4, false)
+            "#,
+        )
+        .bind(otp_id)
+        .bind(email)
+        .bind(otp_code)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(otp_id)
+    }
+
+    pub async fn verify_otp(&self, email: &str, otp_code: &str) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, expires_at, verified
+            FROM otp_verifications
+            WHERE email = $1 AND otp_code = $2 AND verified = false
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(email)
+        .bind(otp_code)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(r) = row {
+            let expires_at: DateTime<Utc> = r.get("expires_at");
+            let otp_id: Uuid = r.get("id");
+
+            // Check if OTP is expired
+            if expires_at < Utc::now() {
+                return Ok(false);
+            }
+
+            // Mark OTP as verified
+            sqlx::query(
+                r#"
+                UPDATE otp_verifications
+                SET verified = true
+                WHERE id = $1
+                "#,
+            )
+            .bind(otp_id)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn cleanup_expired_otps(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM otp_verifications
+            WHERE expires_at < NOW() OR verified = true
+            "#,
+        )
         .execute(&self.pool)
         .await?;
 

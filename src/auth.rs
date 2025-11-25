@@ -1,10 +1,16 @@
 use bcrypt::{hash, verify, DEFAULT_COST};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const JWT_SECRET: &str = "b53e8a3a0a46d1e06a93a1260810edc5ed7419d40beddffc72f040c89bcce50f1825e6a6b0662ab912c9699b0d2a1c527285ca4341de4d34ef041cecbff79d68";
+static JWT_SECRET: Lazy<String> = Lazy::new(|| {
+    std::env::var("JWT_SECRET").unwrap_or_else(|_| {
+        tracing::warn!("JWT_SECRET not set; using insecure default key");
+        "change-me-in-production".to_string()
+    })
+});
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
@@ -40,7 +46,7 @@ impl AuthService {
         encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(JWT_SECRET.as_ref()),
+            &EncodingKey::from_secret(JWT_SECRET.as_bytes()),
         )
         .map_err(|e| format!("Failed to generate token: {}", e))
     }
@@ -48,7 +54,7 @@ impl AuthService {
     pub fn verify_token(token: &str) -> Result<Claims, String> {
         decode::<Claims>(
             token,
-            &DecodingKey::from_secret(JWT_SECRET.as_ref()),
+            &DecodingKey::from_secret(JWT_SECRET.as_bytes()),
             &Validation::default(),
         )
         .map(|data| data.claims)

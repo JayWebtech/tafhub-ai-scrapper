@@ -5,29 +5,66 @@ use axum::{
     routing::{get, post, delete},
     Router,
 };
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn, error};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{Modify, OpenApi, ToSchema};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 use validator::Validate;
+use rand::Rng;
 
 mod scraper;
 mod database;
 mod auth;
+mod email;
 use scraper::{ScrapedData, ScraperConfig, ScraperError, WebScraper};
-use database::Database;
+use database::{Database, User as DbUser};
 use auth::AuthService;
+use email::EmailService;
 
 #[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct SignUpRequest {
+    #[validate(length(min = 1, max = 100, message = "Name must be between 1 and 100 characters"))]
+    pub name: String,
     #[validate(email(message = "Invalid email format"))]
     pub email: String,
     #[validate(length(min = 6, message = "Password must be at least 6 characters"))]
     pub password: String,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct VerifyOtpRequest {
+    #[validate(email(message = "Invalid email format"))]
+    pub email: String,
+    #[validate(length(min = 6, max = 6, message = "OTP must be 6 digits"))]
+    pub otp: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SignUpResponse {
+    pub message: String,
+    pub email: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VerifyOtpResponse {
+    pub message: String,
+    pub token: String,
+    pub user: UserResponse,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UnverifiedEmailResponse {
+    pub message: String,
+    pub email: String,
+    pub requires_verification: bool,
+    pub verification_endpoint: String,
 }
 
 #[derive(Debug, Deserialize, Validate, ToSchema)]
@@ -46,9 +83,26 @@ pub struct AuthResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UserResponse {
     pub id: Uuid,
+    pub name: Option<String>,
     pub email: String,
-    pub is_paid: bool,
     pub credits: i32,
+    pub avatar_url: Option<String>,
+    pub auth_provider: String,
+}
+
+fn user_to_response(user: &DbUser) -> UserResponse {
+    UserResponse {
+        id: user.id,
+        name: user.name.clone(),
+        email: user.email.clone(),
+        credits: user.credits,
+        avatar_url: user.avatar_url.clone(),
+        auth_provider: if user.google_id.is_some() {
+            "google".to_string()
+        } else {
+            "password".to_string()
+        },
+    }
 }
 
 #[derive(Debug, Deserialize, Validate, ToSchema)]
@@ -59,6 +113,11 @@ pub struct BuyCreditsRequest {
 #[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct GoogleSignInRequest {
+    pub id_token: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -166,13 +225,46 @@ fn default_limit() -> usize { 20 }
 #[derive(Clone)]
 pub struct AppState {
     db: Arc<Database>,
+    google_client_id: Arc<String>,
+    email_service: Arc<EmailService>,
 }
 
 impl AppState {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, google_client_id: String) -> Self {
         Self {
             db: Arc::new(db),
+            google_client_id: Arc::new(google_client_id),
+            email_service: Arc::new(EmailService::new()),
         }
+    }
+
+    pub fn google_client_id(&self) -> &str {
+        self.google_client_id.as_ref()
+    }
+}
+
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi
+            .components
+            .get_or_insert_with(Default::default);
+
+        components.add_security_scheme(
+            "bearer",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        );
+
+        components.add_security_scheme(
+            "api_key",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-API-Key"))),
+        );
     }
 }
 
@@ -192,8 +284,6 @@ pub enum ApiError {
     InvalidApiKey,
     #[error("API key not found")]
     ApiKeyNotFound,
-    #[error("Only paid users can create API keys")]
-    PaidUsersOnly,
     #[error("Scraper error: {0}")]
     Scraper(#[from] ScraperError),
     #[error("Internal server error: {0}")]
@@ -210,15 +300,22 @@ impl axum::response::IntoResponse for ApiError {
             ApiError::UserNotFound => (StatusCode::NOT_FOUND, "User not found".to_string()),
             ApiError::InvalidApiKey => (StatusCode::UNAUTHORIZED, "Invalid API key".to_string()),
             ApiError::ApiKeyNotFound => (StatusCode::NOT_FOUND, "API key not found".to_string()),
-            ApiError::PaidUsersOnly => (StatusCode::FORBIDDEN, "Only paid users can create API keys".to_string()),
             ApiError::Scraper(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
-        let body = serde_json::json!({
+        // Build response body
+        let mut body = serde_json::json!({
             "error": message,
             "status": status.as_u16()
         });
+
+        // Add verification endpoint info for unverified email errors
+        if message.contains("Email not verified") {
+            body["requires_verification"] = serde_json::json!(true);
+            body["verification_endpoint"] = serde_json::json!("/api/auth/verify-otp");
+            body["message"] = serde_json::json!(message);
+        }
 
         (status, Json(body)).into_response()
     }
@@ -229,7 +326,7 @@ impl axum::response::IntoResponse for ApiError {
     path = "/api/auth/signup",
     request_body = SignUpRequest,
     responses(
-        (status = 200, description = "User created successfully", body = AuthResponse),
+        (status = 200, description = "OTP sent to email", body = SignUpResponse),
         (status = 400, description = "Validation error"),
     ),
     tag = "auth",
@@ -237,38 +334,200 @@ impl axum::response::IntoResponse for ApiError {
 pub async fn signup(
     State(state): State<AppState>,
     Json(request): Json<SignUpRequest>,
-) -> Result<Json<AuthResponse>, ApiError> {
+) -> Result<Json<SignUpResponse>, ApiError> {
     if let Err(validation_errors) = request.validate() {
         return Err(ApiError::Validation(format!("{}", validation_errors)));
     }
 
-    if state.db.get_user_by_email(&request.email).await
-        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
-        .is_some() {
-        return Err(ApiError::Validation("Email already registered".to_string()));
+    // Check if user already exists
+    if let Some(existing_user) = state.db.get_user_by_email(&request.email).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))? {
+        // If user exists and is verified, return error
+        if existing_user.email_verified {
+            return Err(ApiError::Validation(
+                "Email already registered. Please login instead.".to_string()
+            ));
+        }
+        // If user exists but not verified, return error with guidance
+        return Err(ApiError::Validation(
+            "Email already registered but not verified.".to_string()
+        ));
     }
-
+    
+    // Create unverified user account
     let password_hash = AuthService::hash_password(&request.password)
         .map_err(|e| ApiError::Internal(e))?;
 
-    let user_id = state.db.create_user(&request.email, &password_hash).await
+    let user_id = state.db.create_user(&request.name, &request.email, &password_hash).await
         .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
 
-    let token = AuthService::generate_token(user_id, request.email.clone())
-        .map_err(|e| ApiError::Internal(e))?;
+    // Automatically allocate 5 credits to new users as a welcome bonus
+    state.db.add_credits(user_id, 5, Some("Welcome bonus - new user signup")).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+    info!("✅ Allocated 5 welcome credits to new user: {}", user_id);
 
-    let user = state.db.get_user_by_id(user_id).await
+    // Generate 6-digit OTP
+    let otp_code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+    
+    // Set expiration to 10 minutes from now
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+    // Store OTP in database
+    state.db.create_otp(&request.email, &otp_code, expires_at).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    // Send OTP email (non-blocking - don't wait for email to complete)
+    // This prevents the endpoint from hanging if email sending is slow or fails
+    let email_service = state.email_service.clone();
+    let email_clone = request.email.clone();
+    let otp_clone = otp_code.clone();
+    info!("📧 Attempting to send OTP email to: {}", email_clone);
+    tokio::spawn(async move {
+        info!("📧 Starting email send task for: {}", email_clone);
+        match email_service.send_otp_email(&email_clone, &otp_clone).await {
+            Ok(_) => {
+                info!("✅ OTP email sent successfully to {}", email_clone);
+                println!("✅ OTP email sent successfully to {}", email_clone);
+            }
+            Err(e) => {
+                error!("❌ Failed to send OTP email to {}: {}", email_clone, e);
+                eprintln!("❌ Failed to send OTP email to {}: {}", email_clone, e);
+                eprintln!("   OTP Code for {}: {}", email_clone, otp_clone);
+            }
+        }
+    });
+
+    Ok(Json(SignUpResponse {
+        message: "OTP sent to your email. Please verify your email to complete registration.".to_string(),
+        email: request.email,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/verify-otp",
+    request_body = VerifyOtpRequest,
+    responses(
+        (status = 200, description = "Email verified successfully", body = VerifyOtpResponse),
+        (status = 400, description = "Invalid or expired OTP"),
+    ),
+    tag = "auth",
+)]
+pub async fn verify_otp(
+    State(state): State<AppState>,
+    Json(request): Json<VerifyOtpRequest>,
+) -> Result<Json<VerifyOtpResponse>, ApiError> {
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    // Verify OTP
+    let is_valid = state.db.verify_otp(&request.email, &request.otp).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    if !is_valid {
+        return Err(ApiError::Validation("Invalid or expired OTP".to_string()));
+    }
+
+    // Get user and verify email
+    let user = state.db.get_user_by_email(&request.email).await
         .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| ApiError::UserNotFound)?;
 
-    Ok(Json(AuthResponse {
+    // Mark email as verified
+    state.db.verify_user_email(user.id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    // Get updated user
+    let verified_user = state.db.get_user_by_id(user.id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    // Generate token
+    let token = AuthService::generate_token(verified_user.id, verified_user.email.clone())
+        .map_err(|e| ApiError::Internal(e))?;
+
+    let user_response = user_to_response(&verified_user);
+
+    Ok(Json(VerifyOtpResponse {
+        message: "Email verified successfully".to_string(),
         token,
-        user: UserResponse {
-            id: user.id,
-            email: user.email,
-            is_paid: user.is_paid,
-            credits: user.credits,
-        },
+        user: user_response,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/resend-otp",
+    request_body = SignUpRequest,
+    responses(
+        (status = 200, description = "OTP resent successfully", body = SignUpResponse),
+        (status = 400, description = "Validation error"),
+    ),
+    tag = "auth",
+)]
+pub async fn resend_otp(
+    State(state): State<AppState>,
+    Json(request): Json<SignUpRequest>,
+) -> Result<Json<SignUpResponse>, ApiError> {
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    // Check if user exists
+    let user = state.db.get_user_by_email(&request.email).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::Validation("Email not found. Please sign up first.".to_string()))?;
+
+    // Check if already verified
+    if user.email_verified {
+        return Err(ApiError::Validation("Email already verified".to_string()));
+    }
+
+    // Verify password to ensure it's the correct user
+    let password_hash = user.password_hash.as_ref()
+        .ok_or_else(|| ApiError::Unauthorized("Invalid account type".to_string()))?;
+
+    let valid = AuthService::verify_password(&request.password, password_hash)
+        .map_err(|e| ApiError::Internal(e))?;
+
+    if !valid {
+        return Err(ApiError::Unauthorized("Invalid password".to_string()));
+    }
+
+    // Generate new 6-digit OTP
+    let otp_code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+    
+    // Set expiration to 10 minutes from now
+    let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+    // Store OTP in database
+    state.db.create_otp(&request.email, &otp_code, expires_at).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    // Send OTP email (non-blocking - don't wait for email to complete)
+    let email_service = state.email_service.clone();
+    let email_clone = request.email.clone();
+    let otp_clone = otp_code.clone();
+    info!("📧 Attempting to resend OTP email to: {}", email_clone);
+    tokio::spawn(async move {
+        info!("📧 Starting email resend task for: {}", email_clone);
+        match email_service.send_otp_email(&email_clone, &otp_clone).await {
+            Ok(_) => {
+                info!("✅ OTP email resent successfully to {}", email_clone);
+                println!("✅ OTP email resent successfully to {}", email_clone);
+            }
+            Err(e) => {
+                error!("❌ Failed to resend OTP email to {}: {}", email_clone, e);
+                eprintln!("❌ Failed to resend OTP email to {}: {}", email_clone, e);
+                eprintln!("   OTP Code for {}: {}", email_clone, otp_clone);
+            }
+        }
+    });
+
+    Ok(Json(SignUpResponse {
+        message: "OTP resent to your email. Please verify your email to complete registration.".to_string(),
+        email: request.email,
     }))
 }
 
@@ -278,7 +537,7 @@ pub async fn signup(
     request_body = LoginRequest,
     responses(
         (status = 200, description = "Login successful", body = AuthResponse),
-        (status = 401, description = "Invalid credentials"),
+        (status = 401, description = "Invalid credentials or email not verified"),
     ),
     tag = "auth",
 )]
@@ -294,24 +553,171 @@ pub async fn login(
         .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| ApiError::Unauthorized("Invalid email or password".to_string()))?;
 
-    let valid = AuthService::verify_password(&request.password, &user.password_hash)
+    let password_hash = user.password_hash.as_ref()
+        .ok_or_else(|| ApiError::Unauthorized("Please sign in with Google for this account".to_string()))?;
+
+    let valid = AuthService::verify_password(&request.password, password_hash)
         .map_err(|e| ApiError::Internal(e))?;
 
     if !valid {
         return Err(ApiError::Unauthorized("Invalid email or password".to_string()));
     }
 
+    // Check if email is verified
+    if !user.email_verified {
+        // Automatically resend OTP for unverified users
+        info!("📧 User {} attempted login but email not verified. Resending OTP...", request.email);
+        
+        // Generate new 6-digit OTP
+        let otp_code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+        
+        // Set expiration to 10 minutes from now
+        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+        // Store OTP in database
+        if let Err(e) = state.db.create_otp(&request.email, &otp_code, expires_at).await {
+            error!("Failed to create OTP for unverified user: {}", e);
+            return Err(ApiError::Internal(format!("Failed to generate verification code: {}", e)));
+        }
+
+        // Send OTP email (non-blocking)
+        let email_service = state.email_service.clone();
+        let email_clone = request.email.clone();
+        let otp_clone = otp_code.clone();
+        tokio::spawn(async move {
+            info!("📧 Auto-resending OTP email to unverified user: {}", email_clone);
+            match email_service.send_otp_email(&email_clone, &otp_clone).await {
+                Ok(_) => {
+                    info!("✅ OTP email auto-sent successfully to {}", email_clone);
+                    println!("✅ OTP email auto-sent successfully to {}", email_clone);
+                }
+                Err(e) => {
+                    error!("❌ Failed to auto-send OTP email to {}: {}", email_clone, e);
+                    eprintln!("❌ Failed to auto-send OTP email to {}: {}", email_clone, e);
+                    eprintln!("   OTP Code for {}: {}", email_clone, otp_clone);
+                }
+            }
+        });
+
+        // Return response indicating user needs to verify
+        // The frontend should redirect to /api/auth/verify-otp endpoint
+        return Err(ApiError::Unauthorized(
+            format!(
+                "Email not verified. A new verification code has been sent to {}.",
+                request.email
+            )
+        ));
+    }
+
     let token = AuthService::generate_token(user.id, user.email.clone())
         .map_err(|e| ApiError::Internal(e))?;
 
+    let user_response = user_to_response(&user);
+
     Ok(Json(AuthResponse {
         token,
-        user: UserResponse {
-            id: user.id,
-            email: user.email,
-            is_paid: user.is_paid,
-            credits: user.credits,
-        },
+        user: user_response,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/google",
+    request_body = GoogleSignInRequest,
+    responses(
+        (status = 200, description = "Google sign-in successful", body = AuthResponse),
+        (status = 401, description = "Invalid Google token"),
+    ),
+    tag = "auth",
+)]
+pub async fn google_sign_in(
+    State(state): State<AppState>,
+    Json(request): Json<GoogleSignInRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    #[derive(Debug, Deserialize)]
+    struct GoogleTokenInfo {
+        aud: String,
+        sub: String,
+        email: Option<String>,
+        email_verified: Option<String>,
+        picture: Option<String>,
+    }
+
+    let client = Client::new();
+    let response = client
+        .get("https://oauth2.googleapis.com/tokeninfo")
+        .query(&[("id_token", request.id_token.as_str())])
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to verify Google token: {}", e)))?;
+
+    if !response.status().is_success() {
+        return Err(ApiError::Unauthorized("Invalid Google token".to_string()));
+    }
+
+    let token_info: GoogleTokenInfo = response
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to parse Google token info: {}", e)))?;
+
+    if token_info.aud != state.google_client_id() {
+        return Err(ApiError::Unauthorized("Google token audience mismatch".to_string()));
+    }
+
+    if let Some(verified) = token_info.email_verified.as_deref() {
+        if verified != "true" {
+            return Err(ApiError::Unauthorized("Google email is not verified".to_string()));
+        }
+    }
+
+    let email = token_info
+        .email
+        .ok_or_else(|| ApiError::Unauthorized("Google account does not provide an email".to_string()))?;
+    let google_id = token_info.sub;
+    let picture = token_info.picture;
+
+    let user = if let Some(existing) = state.db.get_user_by_google_id(&google_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))? {
+        state.db.update_google_profile(existing.id, &email, picture.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        state.db.get_user_by_id(existing.id).await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+            .ok_or_else(|| ApiError::UserNotFound)?
+    } else if let Some(existing_email_user) = state.db.get_user_by_email(&email).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))? {
+        state.db.link_google_account(existing_email_user.id, &google_id, picture.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        state.db.update_google_profile(existing_email_user.id, &email, picture.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        state.db.get_user_by_id(existing_email_user.id).await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+            .ok_or_else(|| ApiError::UserNotFound)?
+    } else {
+        let user_id = state.db.create_user_with_google(&google_id, &email, picture.as_deref())
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        
+        // Automatically allocate 5 credits to new Google users as a welcome bonus
+        state.db.add_credits(user_id, 5, Some("Welcome bonus - new user signup (Google)")).await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        info!("✅ Allocated 5 welcome credits to new Google user: {}", user_id);
+        
+        state.db.get_user_by_id(user_id).await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+            .ok_or_else(|| ApiError::UserNotFound)?
+    };
+
+    let token = AuthService::generate_token(user.id, user.email.clone())
+        .map_err(|e| ApiError::Internal(e))?;
+
+    let user_response = user_to_response(&user);
+
+    Ok(Json(AuthResponse {
+        token,
+        user: user_response,
     }))
 }
 
@@ -344,12 +750,7 @@ pub async fn get_current_user(
         .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| ApiError::UserNotFound)?;
 
-    Ok(Json(UserResponse {
-        id: user.id,
-        email: user.email,
-        is_paid: user.is_paid,
-        credits: user.credits,
-    }))
+    Ok(Json(user_to_response(&user)))
 }
 
 #[utoipa::path(
@@ -402,7 +803,6 @@ pub async fn buy_credits(
     responses(
         (status = 200, description = "API key created", body = ApiKeyResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only paid users can create API keys"),
     ),
     security(
         ("bearer" = [])
@@ -422,14 +822,6 @@ pub async fn create_api_key(
 
     let claims = AuthService::verify_token(token)
         .map_err(|_| ApiError::Unauthorized("Invalid token".to_string()))?;
-
-    let user = state.db.get_user_by_id(claims.user_id).await
-        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
-        .ok_or_else(|| ApiError::UserNotFound)?;
-
-    if !user.is_paid {
-        return Err(ApiError::PaidUsersOnly);
-    }
 
     let api_key = format!("sk_{}", Uuid::new_v4().to_string().replace("-", ""));
     let key_hash = AuthService::hash_api_key(&api_key);
@@ -558,13 +950,29 @@ pub async fn get_dashboard_stats(
     let transactions = state.db.get_user_recent_transactions(claims.user_id, 10).await
         .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
 
+    // Get credit usage for the last 30 days for graph
+    let credit_usage = state.db.get_user_credit_usage_last_30_days(claims.user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    // Format credit usage data for graph (ensure all 30 days are included, even if 0)
+    let usage_map: HashMap<chrono::NaiveDate, i32> = credit_usage.into_iter().collect();
+    let mut graph_data = Vec::new();
+    let today = chrono::Utc::now().date_naive();
+    
+    // Generate data for last 30 days
+    for i in 0..30 {
+        let date = today - chrono::Duration::days(29 - i);
+        let credits_used = usage_map.get(&date).copied().unwrap_or(0);
+        graph_data.push(serde_json::json!({
+            "date": date.format("%Y-%m-%d").to_string(),
+            "credits_used": credits_used,
+        }));
+    }
+
+    let user_summary = user_to_response(&user);
+
     Ok(Json(serde_json::json!({
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "is_paid": user.is_paid,
-            "credits": user.credits,
-        },
+        "user": user_summary,
         "stats": {
             "total_jobs": job_count,
             "credits": user.credits,
@@ -576,6 +984,7 @@ pub async fn get_dashboard_stats(
             "description": t.description,
             "created_at": t.created_at.to_rfc3339(),
         })).collect::<Vec<_>>(),
+        "credit_usage_last_30_days": graph_data,
     })))
 }
 
@@ -1007,6 +1416,9 @@ async fn run_scraping_job(
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = dotenvy::dotenv() {
+        tracing::warn!("dotenv not loaded: {}", e);
+    }
     tracing_subscriber::fmt::init();
 
     let database_url = std::env::var("DATABASE_URL")
@@ -1019,14 +1431,20 @@ async fn main() {
     
     info!("Successfully connected to database");
     
-    let state = AppState::new(db);
+    let google_client_id = std::env::var("GOOGLE_CLIENT_ID")
+        .expect("GOOGLE_CLIENT_ID environment variable must be set");
+    
+    let state = AppState::new(db, google_client_id);
 
     #[derive(OpenApi)]
     #[openapi(
         paths(
             health_check,
             signup,
+            verify_otp,
+            resend_otp,
             login,
+            google_sign_in,
             get_current_user,
             buy_credits,
             get_dashboard_stats,
@@ -1041,7 +1459,11 @@ async fn main() {
         ),
         components(schemas(
             SignUpRequest,
+            VerifyOtpRequest,
+            SignUpResponse,
+            VerifyOtpResponse,
             LoginRequest,
+            GoogleSignInRequest,
             AuthResponse,
             UserResponse,
             BuyCreditsRequest,
@@ -1066,6 +1488,7 @@ async fn main() {
             (name = "scraping", description = "Web scraping endpoints"),
             (name = "jobs", description = "Job management endpoints"),
         ),
+        modifiers(&SecurityAddon)
     )]
     struct ApiDoc;
 
@@ -1073,7 +1496,10 @@ async fn main() {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health_check))
         .route("/api/auth/signup", post(signup))
+        .route("/api/auth/verify-otp", post(verify_otp))
+        .route("/api/auth/resend-otp", post(resend_otp))
         .route("/api/auth/login", post(login))
+        .route("/api/auth/google", post(google_sign_in))
         
         // Protected routes (JWT token required)
         .route("/api/user", get(get_current_user))
@@ -1095,10 +1521,44 @@ async fn main() {
         .with_state(state);
 
     // Start the server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("🚀 Web Scraper API server starting on http://0.0.0.0:3000");
-    println!("  Swagger UI: http://localhost:3000/swagger-ui");
-    println!("  OpenAPI JSON: http://localhost:3000/api-docs/openapi.json");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
+    info!("🚀 Web Scraper API server starting on http://0.0.0.0:3001");
+    println!("\n📋 Available Endpoints:");
+    println!("\n🔓 Public Endpoints:");
+    println!("  GET  /health                    - Health check");
+    println!("  POST /api/auth/signup           - Sign up with email & password");
+    println!("  POST /api/auth/login            - Email/password login");
+    println!("  POST /api/auth/google           - Sign in with Google ID token");
+    println!("\n🔐 Protected Endpoints (Bearer Token):");
+    println!("  GET  /api/user                  - Get current user");
+    println!("  POST /api/user/credits          - Buy credits");
+    println!("  GET  /api/user/dashboard        - Get dashboard stats");
+    println!("  POST /api/api-keys              - Create API key");
+    println!("  GET  /api/api-keys              - List API keys");
+    println!("  DELETE /api/api-keys/:id        - Delete API key");
+    println!("  GET  /api/jobs                  - List jobs");
+    println!("  GET  /api/jobs/:job_id          - Get job status");
+    println!("  GET  /api/jobs/:job_id/results  - Get job results");
+    println!("  DELETE /api/jobs/:job_id        - Delete job");
+    println!("\n🔑 API Key Protected:");
+    println!("  POST /api/v1/scrape             - Start scraping (uses X-API-Key header)");
+    println!("\n📖 Example Usage:");
+    println!("  # Sign up:");
+    println!("  curl -X POST http://localhost:3001/api/auth/signup \\");
+    println!("    -H 'Content-Type: application/json' \\");
+    println!("    -d '{{\"email\": \"user@example.com\", \"password\": \"password123\"}}'");
+    println!("\n  # Sign in with Google:");
+    println!("  curl -X POST http://localhost:3001/api/auth/google \\");
+    println!("    -H 'Content-Type: application/json' \\");
+    println!("    -d '{{\"id_token\": \"<GOOGLE_ID_TOKEN>\"}}'");
+    println!("\n  # Scrape with API key:");
+    println!("  curl -X POST http://localhost:3001/api/v1/scrape \\");
+    println!("    -H 'Content-Type: application/json' \\");
+    println!("    -H 'X-API-Key: sk_your-api-key' \\");
+    println!("    -d '{{\"url\": \"https://example.com\", \"context\": \"get all emails\"}}'");
+    println!("\n📚 API Documentation:");
+    println!("  Swagger UI: http://localhost:3001/swagger-ui");
+    println!("  OpenAPI JSON: http://localhost:3001/api-docs/openapi.json");
     println!();
 
     axum::serve(listener, app).await.unwrap();

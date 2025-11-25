@@ -3,10 +3,13 @@
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT,
     email TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    is_paid BOOLEAN NOT NULL DEFAULT false,
+    password_hash TEXT,
+    google_id TEXT UNIQUE,
+    avatar_url TEXT,
     credits INTEGER NOT NULL DEFAULT 0,
+    email_verified BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -18,6 +21,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash TEXT UNIQUE NOT NULL,
     name TEXT,
     last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- OTP verification table
+CREATE TABLE IF NOT EXISTS otp_verifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email TEXT NOT NULL,
+    otp_code TEXT NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    verified BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -75,6 +88,11 @@ CREATE TABLE IF NOT EXISTS scraped_data (
 
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
+CREATE INDEX IF NOT EXISTS idx_users_email_verified ON users(email_verified);
+CREATE INDEX IF NOT EXISTS idx_otp_verifications_email ON otp_verifications(email);
+CREATE INDEX IF NOT EXISTS idx_otp_verifications_code ON otp_verifications(otp_code);
+CREATE INDEX IF NOT EXISTS idx_otp_verifications_expires_at ON otp_verifications(expires_at);
 CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_id ON credit_transactions(user_id);
