@@ -1,0 +1,6 @@
+# Rust toolchain configuration for Railway deployment
+# This ensures Railway uses a compatible Rust version
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+

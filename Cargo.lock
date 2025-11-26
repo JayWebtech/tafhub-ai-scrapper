@@ -2209,6 +2209,7 @@ name = "scraper"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64ct",
  "bcrypt",
  "chrono",
  "dotenvy",
