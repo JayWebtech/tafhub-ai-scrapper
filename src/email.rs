@@ -35,16 +35,22 @@ impl EmailService {
             .unwrap_or(true);
 
         let resend_api_key = env::var("RESEND_API_KEY").ok();
+        // Use Resend's default testing domain if RESEND_FROM_EMAIL is not set
+        // This works without domain verification: onboarding@resend.dev
         let from_email = env::var("RESEND_FROM_EMAIL")
             .or_else(|_| env::var("SMTP_FROM_EMAIL"))
-            .unwrap_or_else(|_| "noreply@tafhubscrapper.com".to_string());
+            .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
 
         // Log configuration status
         println!("📧 Email Service Configuration (Resend):");
         println!("   RESEND_ENABLED: {}", resend_enabled);
         if resend_enabled {
             println!("   RESEND_API_KEY: {}", if resend_api_key.is_some() { "SET" } else { "NOT SET" });
-            println!("   RESEND_FROM_EMAIL: {}", from_email);
+            if from_email == "onboarding@resend.dev" {
+                println!("   RESEND_FROM_EMAIL: {} (using Resend default - no domain verification needed)", from_email);
+            } else {
+                println!("   RESEND_FROM_EMAIL: {}", from_email);
+            }
         } else {
             println!("   ⚠️  Resend disabled - OTPs will be logged to console");
         }
