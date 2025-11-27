@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn, error};
+use ratelimit::RateLimitLayer;
+use axum::middleware;
 use utoipa::{Modify, OpenApi, ToSchema};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa_swagger_ui::SwaggerUi;
@@ -23,6 +25,7 @@ mod scraper;
 mod database;
 mod auth;
 mod email;
+mod ratelimit;
 use scraper::{ScrapedData, ScraperConfig, ScraperError, WebScraper};
 use database::{Database, User as DbUser};
 use auth::AuthService;
@@ -288,6 +291,8 @@ pub enum ApiError {
     Scraper(#[from] ScraperError),
     #[error("Internal server error: {0}")]
     Internal(String),
+    #[error("Rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
 }
 
 impl axum::response::IntoResponse for ApiError {
@@ -302,6 +307,7 @@ impl axum::response::IntoResponse for ApiError {
             ApiError::ApiKeyNotFound => (StatusCode::NOT_FOUND, "API key not found".to_string()),
             ApiError::Scraper(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::RateLimitExceeded(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
         };
 
         // Build response body
@@ -1492,16 +1498,34 @@ async fn main() {
     )]
     struct ApiDoc;
 
-    let app = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .route("/health", get(health_check))
+    // Rate limiting configurations
+    // Strict rate limit for authentication endpoints: 5 requests per minute per IP
+    let auth_rate_limit = RateLimitLayer::new(5, std::time::Duration::from_secs(60));
+    
+    // Moderate rate limit for API endpoints: 30 requests per minute per IP
+    let api_rate_limit = RateLimitLayer::new(30, std::time::Duration::from_secs(60));
+    
+    // General rate limit for other endpoints: 60 requests per minute per IP
+    let general_rate_limit = RateLimitLayer::new(60, std::time::Duration::from_secs(60));
+
+    // Create separate routers with different rate limits
+    let auth_routes = Router::new()
         .route("/api/auth/signup", post(signup))
         .route("/api/auth/verify-otp", post(verify_otp))
         .route("/api/auth/resend-otp", post(resend_otp))
         .route("/api/auth/login", post(login))
         .route("/api/auth/google", post(google_sign_in))
-        
-        // Protected routes (JWT token required)
+        .layer(middleware::from_fn(move |req, next| {
+            RateLimitLayer::rate_limit_middleware(auth_rate_limit.limiter().clone(), req, next)
+        }));
+
+    let api_routes = Router::new()
+        .route("/api/v1/scrape", post(start_scraping))
+        .layer(middleware::from_fn(move |req, next| {
+            RateLimitLayer::rate_limit_middleware(api_rate_limit.limiter().clone(), req, next)
+        }));
+
+    let general_routes = Router::new()
         .route("/api/user", get(get_current_user))
         .route("/api/user/credits", post(buy_credits))
         .route("/api/user/dashboard", get(get_dashboard_stats))
@@ -1512,10 +1536,16 @@ async fn main() {
         .route("/api/jobs/:job_id", get(get_job_status))
         .route("/api/jobs/:job_id", delete(delete_job))
         .route("/api/jobs/:job_id/results", get(get_job_results))
-        
-        // API key protected routes
-        .route("/api/v1/scrape", post(start_scraping))
-        
+        .layer(middleware::from_fn(move |req, next| {
+            RateLimitLayer::rate_limit_middleware(general_rate_limit.limiter().clone(), req, next)
+        }));
+
+    let app = Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .route("/health", get(health_check))
+        .merge(auth_routes)
+        .merge(api_routes)
+        .merge(general_routes)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

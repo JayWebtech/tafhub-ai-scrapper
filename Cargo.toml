@@ -9,6 +9,9 @@ axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1.0", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+# Rate limiting
+governor = "0.6"
+futures = "0.3"
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
@@ -43,8 +46,7 @@ headers = "0.4"
 sha2 = "0.10"
 hex = "0.4"
 
-# Email service
-lettre = { version = "0.11", features = ["tokio1-native-tls"] }
+# Email service (using Resend API via reqwest)
 rand = "0.8"
 
 # API Documentation
