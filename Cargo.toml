@@ -49,6 +49,8 @@ hex = "0.4"
 # Email service (using Resend API via reqwest)
 rand = "0.8"
 
+# Payment processing (using Stripe API directly via reqwest)
+
 # API Documentation
 utoipa = { version = "4.2", features = ["axum_extras", "chrono"] }
 utoipa-swagger-ui = { version = "6.0", features = ["axum"] }

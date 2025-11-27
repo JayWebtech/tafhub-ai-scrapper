@@ -114,6 +114,25 @@ pub struct BuyCreditsRequest {
 }
 
 #[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct UpdateProfileRequest {
+    #[validate(length(min = 1, max = 100, message = "Name must be between 1 and 100 characters"))]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    #[validate(length(min = 6, message = "New password must be at least 6 characters"))]
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct PurchaseCreditsRequest {
+    #[validate(range(min = 10.0, message = "Minimum purchase is $10.00"))]
+    pub amount_usd: f64, // Amount in USD (minimum $10.00)
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct CreateApiKeyRequest {
     pub name: Option<String>,
 }
@@ -230,19 +249,25 @@ pub struct AppState {
     db: Arc<Database>,
     google_client_id: Arc<String>,
     email_service: Arc<EmailService>,
+    stripe_secret_key: Arc<String>,
 }
 
 impl AppState {
-    pub fn new(db: Database, google_client_id: String) -> Self {
+    pub fn new(db: Database, google_client_id: String, stripe_secret_key: String) -> Self {
         Self {
             db: Arc::new(db),
             google_client_id: Arc::new(google_client_id),
             email_service: Arc::new(EmailService::new()),
+            stripe_secret_key: Arc::new(stripe_secret_key),
         }
     }
 
     pub fn google_client_id(&self) -> &str {
         self.google_client_id.as_ref()
+    }
+
+    pub fn stripe_secret_key(&self) -> &str {
+        self.stripe_secret_key.as_ref()
     }
 }
 
@@ -994,6 +1019,339 @@ pub async fn get_dashboard_stats(
     })))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/user/profile",
+    request_body = UpdateProfileRequest,
+    responses(
+        (status = 200, description = "Profile updated successfully", body = UserResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "user",
+)]
+pub async fn update_profile(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateProfileRequest>,
+) -> Result<Json<UserResponse>, ApiError> {
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let claims = AuthService::verify_token(token)
+        .map_err(|_| ApiError::Unauthorized("Invalid token".to_string()))?;
+
+    state.db.update_user_name(claims.user_id, &request.name).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let user = state.db.get_user_by_id(claims.user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    Ok(Json(user_to_response(&user)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/user/change-password",
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password changed successfully"),
+        (status = 401, description = "Unauthorized or invalid current password"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "user",
+)]
+pub async fn change_password(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let claims = AuthService::verify_token(token)
+        .map_err(|_| ApiError::Unauthorized("Invalid token".to_string()))?;
+
+    let user = state.db.get_user_by_id(claims.user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    let password_hash = user.password_hash.as_ref()
+        .ok_or_else(|| ApiError::Unauthorized("Please sign in with Google for this account".to_string()))?;
+
+    let valid = AuthService::verify_password(&request.current_password, password_hash)
+        .map_err(|e| ApiError::Internal(e))?;
+
+    if !valid {
+        return Err(ApiError::Unauthorized("Invalid current password".to_string()));
+    }
+
+    let new_password_hash = AuthService::hash_password(&request.new_password)
+        .map_err(|e| ApiError::Internal(e))?;
+
+    state.db.update_user_password(claims.user_id, &new_password_hash).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "message": "Password changed successfully"
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/user/billing-history",
+    responses(
+        (status = 200, description = "Billing history", body = Vec<Payment>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "user",
+)]
+pub async fn get_billing_history(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let claims = AuthService::verify_token(token)
+        .map_err(|_| ApiError::Unauthorized("Invalid token".to_string()))?;
+
+    let payments = state.db.get_user_payments(claims.user_id, 50).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(payments.into_iter().map(|p| serde_json::json!({
+        "id": p.id,
+        "amount_cents": p.amount_cents,
+        "amount_usd": p.amount_cents as f64 / 100.0,
+        "credits": p.credits,
+        "status": p.status,
+        "currency": p.currency,
+        "created_at": p.created_at.to_rfc3339(),
+        "updated_at": p.updated_at.to_rfc3339(),
+    })).collect()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/user/purchase-credits",
+    request_body = PurchaseCreditsRequest,
+    responses(
+        (status = 200, description = "Payment link created", body = serde_json::Value),
+        (status = 401, description = "Unauthorized"),
+        (status = 400, description = "Invalid amount"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "user",
+)]
+pub async fn purchase_credits(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<PurchaseCreditsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    // Validate minimum purchase amount
+    if request.amount_usd < 10.0 {
+        return Err(ApiError::Validation("Minimum purchase is $10.00".to_string()));
+    }
+
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let claims = AuthService::verify_token(token)
+        .map_err(|_| ApiError::Unauthorized("Invalid token".to_string()))?;
+
+    let user = state.db.get_user_by_id(claims.user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    // Calculate credits: $0.10 per credit
+    let credits = ((request.amount_usd / 0.10) as i32).max(100); // Minimum 100 credits for $10
+    let amount_cents = (request.amount_usd * 100.0) as i32;
+
+    // Create Stripe checkout session via API
+    let frontend_url = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    
+    // Stripe API requires form-encoded data with nested structure
+    let success_url = format!("{}/payment/success?session_id={{CHECKOUT_SESSION_ID}}", frontend_url);
+    let cancel_url = format!("{}/payment/cancel", frontend_url);
+    let client_ref_id = claims.user_id.to_string();
+    let product_name = format!("{} Credits", credits);
+    let product_desc = format!("Web scraping credits - ${:.2}", request.amount_usd);
+    let unit_amount_str = amount_cents.to_string();
+    
+    let mut form_params = Vec::new();
+    form_params.push(("mode", "payment"));
+    form_params.push(("success_url", success_url.as_str()));
+    form_params.push(("cancel_url", cancel_url.as_str()));
+    form_params.push(("customer_email", user.email.as_str()));
+    form_params.push(("client_reference_id", client_ref_id.as_str()));
+    form_params.push(("line_items[0][price_data][currency]", "usd"));
+    form_params.push(("line_items[0][price_data][product_data][name]", product_name.as_str()));
+    form_params.push(("line_items[0][price_data][product_data][description]", product_desc.as_str()));
+    form_params.push(("line_items[0][price_data][unit_amount]", unit_amount_str.as_str()));
+    form_params.push(("line_items[0][quantity]", "1"));
+
+    let client = Client::new();
+    let response = client
+        .post("https://api.stripe.com/v1/checkout/sessions")
+        .header("Authorization", format!("Bearer {}", state.stripe_secret_key()))
+        .form(&form_params)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to create Stripe checkout session: {}", e)))?;
+
+    if !response.status().is_success() {
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(ApiError::Internal(format!("Stripe API error: {}", error_text)));
+    }
+
+    let checkout_session: serde_json::Value = response.json().await
+        .map_err(|e| ApiError::Internal(format!("Failed to parse Stripe response: {}", e)))?;
+
+    let session_id = checkout_session["id"]
+        .as_str()
+        .ok_or_else(|| ApiError::Internal("Invalid Stripe response: missing session id".to_string()))?;
+    
+    let checkout_url = checkout_session["url"]
+        .as_str()
+        .ok_or_else(|| ApiError::Internal("Invalid Stripe response: missing url".to_string()))?;
+
+    // Store payment in database
+    state.db.create_payment(
+        claims.user_id,
+        session_id,
+        amount_cents,
+        credits,
+    ).await
+    .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "checkout_url": checkout_url,
+        "session_id": session_id,
+        "amount_usd": request.amount_usd,
+        "credits": credits,
+    })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/webhooks/stripe",
+    responses(
+        (status = 200, description = "Webhook processed"),
+        (status = 400, description = "Invalid webhook"),
+    ),
+    tag = "webhooks",
+)]
+pub async fn stripe_webhook(
+    _headers: HeaderMap,
+    State(state): State<AppState>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Note: In production, you should verify the webhook signature
+    // For now, we'll parse the event directly
+    // To verify signature, use: stripe::Webhook::construct_event()
+    
+    let event: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| ApiError::Validation(format!("Invalid JSON: {}", e)))?;
+
+    let event_type = event["type"]
+        .as_str()
+        .ok_or_else(|| ApiError::Validation("Missing event type".to_string()))?;
+    
+    let event_id = event["id"]
+        .as_str()
+        .unwrap_or("unknown");
+
+    info!("Received Stripe webhook: {} (id: {})", event_type, event_id);
+
+    if let Some(data) = event["data"]["object"].as_object() {
+        if let Some(session_id) = data.get("id").and_then(|v| v.as_str()) {
+            match event_type {
+                "checkout.session.completed" => {
+                    info!("Processing completed checkout session: {}", session_id);
+                    
+                    // Get payment from database
+                    let payment = state.db.get_payment_by_checkout_session(session_id).await
+                        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+                        .ok_or_else(|| ApiError::Internal("Payment not found".to_string()))?;
+
+                    // Update payment status
+                    let payment_intent_id = data.get("payment_intent")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    
+                    state.db.update_payment_status(
+                        session_id,
+                        "completed",
+                        payment_intent_id.as_deref(),
+                    ).await
+                    .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+                    // Add credits to user account
+                    state.db.add_credits(
+                        payment.user_id,
+                        payment.credits,
+                        Some(&format!("Stripe payment - ${:.2}", payment.amount_cents as f64 / 100.0)),
+                    ).await
+                    .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+                    info!("Added {} credits to user {} from payment {}", 
+                        payment.credits, payment.user_id, session_id);
+                }
+                "checkout.session.async_payment_failed" => {
+                    info!("Payment failed for checkout session: {}", session_id);
+                    state.db.update_payment_status(session_id, "failed", None).await
+                        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+                }
+                _ => {
+                    warn!("Unhandled checkout session event: {}", event_type);
+                }
+            }
+        } else {
+            warn!("Unhandled Stripe event object type: {}", event_type);
+        }
+    } else {
+        warn!("Invalid event data structure");
+    }
+
+    Ok(Json(serde_json::json!({
+        "received": true
+    })))
+}
+
 // API Handlers
 #[utoipa::path(
     post,
@@ -1440,7 +1798,10 @@ async fn main() {
     let google_client_id = std::env::var("GOOGLE_CLIENT_ID")
         .expect("GOOGLE_CLIENT_ID environment variable must be set");
     
-    let state = AppState::new(db, google_client_id);
+    let stripe_secret_key = std::env::var("STRIPE_SECRET_KEY")
+        .expect("STRIPE_SECRET_KEY environment variable must be set");
+    
+    let state = AppState::new(db, google_client_id, stripe_secret_key);
 
     #[derive(OpenApi)]
     #[openapi(
@@ -1454,6 +1815,11 @@ async fn main() {
             get_current_user,
             buy_credits,
             get_dashboard_stats,
+            update_profile,
+            change_password,
+            get_billing_history,
+            purchase_credits,
+            stripe_webhook,
             create_api_key,
             list_api_keys,
             delete_api_key,
@@ -1473,6 +1839,9 @@ async fn main() {
             AuthResponse,
             UserResponse,
             BuyCreditsRequest,
+            UpdateProfileRequest,
+            ChangePasswordRequest,
+            PurchaseCreditsRequest,
             CreateApiKeyRequest,
             ApiKeyResponse,
             ApiKeyListResponse,
@@ -1529,6 +1898,10 @@ async fn main() {
         .route("/api/user", get(get_current_user))
         .route("/api/user/credits", post(buy_credits))
         .route("/api/user/dashboard", get(get_dashboard_stats))
+        .route("/api/user/profile", axum::routing::patch(update_profile))
+        .route("/api/user/change-password", post(change_password))
+        .route("/api/user/billing-history", get(get_billing_history))
+        .route("/api/user/purchase-credits", post(purchase_credits))
         .route("/api/api-keys", post(create_api_key))
         .route("/api/api-keys", get(list_api_keys))
         .route("/api/api-keys/:api_key_id", delete(delete_api_key))
@@ -1546,6 +1919,8 @@ async fn main() {
         .merge(auth_routes)
         .merge(api_routes)
         .merge(general_routes)
+        // Webhook routes (no rate limiting, no auth)
+        .route("/api/webhooks/stripe", post(stripe_webhook))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);

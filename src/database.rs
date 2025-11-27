@@ -77,6 +77,20 @@ pub struct CreditTransaction {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Payment {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub stripe_payment_intent_id: Option<String>,
+    pub stripe_checkout_session_id: Option<String>,
+    pub amount_cents: i32,
+    pub credits: i32,
+    pub status: String,
+    pub currency: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 pub struct Database {
     pool: PgPool,
 }
@@ -1024,5 +1038,167 @@ impl Database {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    // User profile update methods
+    pub async fn update_user_name(&self, user_id: Uuid, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET name = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_user_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET password_hash = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    // Payment methods
+    pub async fn create_payment(
+        &self,
+        user_id: Uuid,
+        stripe_checkout_session_id: &str,
+        amount_cents: i32,
+        credits: i32,
+    ) -> Result<Uuid, sqlx::Error> {
+        let payment_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO payments (id, user_id, stripe_checkout_session_id, amount_cents, credits, status, currency)
+            VALUES ($1, $2, $3, $4, $5, 'pending', 'usd')
+            "#,
+        )
+        .bind(payment_id)
+        .bind(user_id)
+        .bind(stripe_checkout_session_id)
+        .bind(amount_cents)
+        .bind(credits)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(payment_id)
+    }
+
+    pub async fn update_payment_status(
+        &self,
+        stripe_checkout_session_id: &str,
+        status: &str,
+        stripe_payment_intent_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        if let Some(payment_intent_id) = stripe_payment_intent_id {
+            sqlx::query(
+                r#"
+                UPDATE payments
+                SET status = $3, stripe_payment_intent_id = $2, updated_at = NOW()
+                WHERE stripe_checkout_session_id = $1
+                "#,
+            )
+            .bind(stripe_checkout_session_id)
+            .bind(payment_intent_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE payments
+                SET status = $2, updated_at = NOW()
+                WHERE stripe_checkout_session_id = $1
+                "#,
+            )
+            .bind(stripe_checkout_session_id)
+            .bind(status)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_payment_by_checkout_session(
+        &self,
+        stripe_checkout_session_id: &str,
+    ) -> Result<Option<Payment>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, user_id, stripe_payment_intent_id, stripe_checkout_session_id, 
+                   amount_cents, credits, status, currency, created_at, updated_at
+            FROM payments
+            WHERE stripe_checkout_session_id = $1
+            "#,
+        )
+        .bind(stripe_checkout_session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| Payment {
+            id: r.get("id"),
+            user_id: r.get("user_id"),
+            stripe_payment_intent_id: r.try_get("stripe_payment_intent_id").ok(),
+            stripe_checkout_session_id: r.try_get("stripe_checkout_session_id").ok(),
+            amount_cents: r.get("amount_cents"),
+            credits: r.get("credits"),
+            status: r.get("status"),
+            currency: r.get("currency"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    pub async fn get_user_payments(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<Payment>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, stripe_payment_intent_id, stripe_checkout_session_id, 
+                   amount_cents, credits, status, currency, created_at, updated_at
+            FROM payments
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| Payment {
+                id: r.get("id"),
+                user_id: r.get("user_id"),
+                stripe_payment_intent_id: r.try_get("stripe_payment_intent_id").ok(),
+                stripe_checkout_session_id: r.try_get("stripe_checkout_session_id").ok(),
+                amount_cents: r.get("amount_cents"),
+                credits: r.get("credits"),
+                status: r.get("status"),
+                currency: r.get("currency"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 }
