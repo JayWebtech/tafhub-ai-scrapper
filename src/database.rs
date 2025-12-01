@@ -43,6 +43,7 @@ pub struct User {
     pub avatar_url: Option<String>,
     pub credits: i32,
     pub email_verified: bool,
+    pub is_admin: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -127,7 +128,7 @@ impl Database {
     pub async fn get_user_by_google_id(&self, google_id: &str) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, created_at, updated_at
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, is_admin, created_at, updated_at
             FROM users
             WHERE google_id = $1
             "#,
@@ -145,6 +146,7 @@ impl Database {
             avatar_url: r.try_get("avatar_url").ok(),
             credits: r.get("credits"),
             email_verified: r.get("email_verified"),
+            is_admin: r.get("is_admin"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
@@ -239,7 +241,7 @@ impl Database {
     pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, created_at, updated_at
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, is_admin, created_at, updated_at
             FROM users 
             WHERE email = $1
             "#,
@@ -257,6 +259,7 @@ impl Database {
             avatar_url: r.try_get("avatar_url").ok(),
             credits: r.get("credits"),
             email_verified: r.get("email_verified"),
+            is_admin: r.get("is_admin"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
@@ -265,7 +268,7 @@ impl Database {
     pub async fn get_user_by_id(&self, user_id: Uuid) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, created_at, updated_at
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, is_admin, created_at, updated_at
             FROM users 
             WHERE id = $1
             "#,
@@ -283,6 +286,7 @@ impl Database {
             avatar_url: r.try_get("avatar_url").ok(),
             credits: r.get("credits"),
             email_verified: r.get("email_verified"),
+            is_admin: r.get("is_admin"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
         }))
@@ -1200,5 +1204,200 @@ impl Database {
                 updated_at: r.get("updated_at"),
             })
             .collect())
+    }
+
+    // Admin methods
+    /// Get all users with pagination
+    pub async fn get_all_users(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<User>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, email, password_hash, google_id, avatar_url, credits, email_verified, is_admin, created_at, updated_at
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| User {
+                id: r.get("id"),
+                name: r.try_get("name").ok(),
+                email: r.get("email"),
+                password_hash: r.try_get("password_hash").ok(),
+                google_id: r.try_get("google_id").ok(),
+                avatar_url: r.try_get("avatar_url").ok(),
+                credits: r.get("credits"),
+                email_verified: r.get("email_verified"),
+                is_admin: r.get("is_admin"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    /// Get total count of users
+    pub async fn get_total_users_count(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM users
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get("count"))
+    }
+
+    /// Get all payments with pagination
+    pub async fn get_all_payments(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Payment>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, stripe_payment_intent_id, stripe_checkout_session_id, 
+                   amount_cents, credits, status, currency, created_at, updated_at
+            FROM payments
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| Payment {
+                id: r.get("id"),
+                user_id: r.get("user_id"),
+                stripe_payment_intent_id: r.try_get("stripe_payment_intent_id").ok(),
+                stripe_checkout_session_id: r.try_get("stripe_checkout_session_id").ok(),
+                amount_cents: r.get("amount_cents"),
+                credits: r.get("credits"),
+                status: r.get("status"),
+                currency: r.get("currency"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    /// Get total payment statistics
+    pub async fn get_payment_stats(&self) -> Result<(i64, i64, f64), sqlx::Error> {
+        // Returns: (total_payments, total_completed_payments, total_revenue_cents)
+        let row = sqlx::query(
+            r#"
+            SELECT 
+                COUNT(*) as total_payments,
+                COUNT(*) FILTER (WHERE status = 'completed') as completed_payments,
+                COALESCE(SUM(amount_cents) FILTER (WHERE status = 'completed'), 0) as total_revenue_cents
+            FROM payments
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total: i64 = row.get("total_payments");
+        let completed: i64 = row.get("completed_payments");
+        let revenue: i64 = row.get("total_revenue_cents");
+
+        Ok((total, completed, revenue as f64))
+    }
+
+    /// Get total credits purchased
+    pub async fn get_total_credits_purchased(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(credits) FILTER (WHERE status = 'completed'), 0) as total_credits
+            FROM payments
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get("total_credits"))
+    }
+
+    /// Get total credits used (deductions)
+    pub async fn get_total_credits_used(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(ABS(amount)) FILTER (WHERE transaction_type = 'deduction'), 0) as total_used
+            FROM credit_transactions
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get("total_used"))
+    }
+
+    /// Get total jobs count
+    pub async fn get_total_jobs_count(&self) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM jobs
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row.get("count"))
+    }
+
+    /// Update user admin status
+    pub async fn update_user_admin_status(
+        &self,
+        user_id: Uuid,
+        is_admin: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET is_admin = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(is_admin)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update user credits (admin operation)
+    pub async fn admin_update_user_credits(
+        &self,
+        user_id: Uuid,
+        credits: i32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET credits = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(credits)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 }

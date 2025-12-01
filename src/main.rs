@@ -93,6 +93,61 @@ pub struct UserResponse {
     pub auth_provider: String,
 }
 
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct AdminLoginRequest {
+    #[validate(email(message = "Invalid email format"))]
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminUserResponse {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub email: String,
+    pub credits: i32,
+    pub avatar_url: Option<String>,
+    pub auth_provider: String,
+    pub email_verified: bool,
+    pub is_admin: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminStatsResponse {
+    pub total_users: i64,
+    pub total_payments: i64,
+    pub total_completed_payments: i64,
+    pub total_revenue_usd: f64,
+    pub total_credits_purchased: i64,
+    pub total_credits_used: i64,
+    pub total_jobs: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminUsersListResponse {
+    pub total: i64,
+    pub users: Vec<AdminUserResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminPaymentsListResponse {
+    pub total: usize,
+    pub payments: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct UpdateUserAdminStatusRequest {
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct UpdateUserCreditsRequest {
+    #[validate(range(min = 0, message = "Credits must be non-negative"))]
+    pub credits: i32,
+}
+
 fn user_to_response(user: &DbUser) -> UserResponse {
     UserResponse {
         id: user.id,
@@ -1709,6 +1764,391 @@ pub async fn delete_job(
     }
 }
 
+// Helper function to verify admin access
+async fn verify_admin(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Uuid, ApiError> {
+    let token = headers
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let claims = AuthService::verify_token(token)
+        .map_err(|_| ApiError::Unauthorized("Invalid token".to_string()))?;
+
+    let user = state.db.get_user_by_id(claims.user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    if !user.is_admin {
+        return Err(ApiError::Unauthorized("Admin access required".to_string()));
+    }
+
+    Ok(user.id)
+}
+
+// Admin login endpoint
+#[utoipa::path(
+    post,
+    path = "/api/admin/login",
+    request_body = AdminLoginRequest,
+    responses(
+        (status = 200, description = "Admin login successful", body = AuthResponse),
+        (status = 401, description = "Invalid credentials or not an admin"),
+    ),
+    tag = "admin",
+)]
+pub async fn admin_login(
+    State(state): State<AppState>,
+    Json(request): Json<AdminLoginRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    let user = state.db.get_user_by_email(&request.email).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::Unauthorized("Invalid email or password".to_string()))?;
+
+    // Check if user is admin
+    if !user.is_admin {
+        return Err(ApiError::Unauthorized("Admin access required".to_string()));
+    }
+
+    let password_hash = user.password_hash.as_ref()
+        .ok_or_else(|| ApiError::Unauthorized("Please sign in with Google for this account".to_string()))?;
+
+    let valid = AuthService::verify_password(&request.password, password_hash)
+        .map_err(|e| ApiError::Internal(e))?;
+
+    if !valid {
+        return Err(ApiError::Unauthorized("Invalid email or password".to_string()));
+    }
+
+    // Check if email is verified
+    if !user.email_verified {
+        return Err(ApiError::Unauthorized("Email not verified".to_string()));
+    }
+
+    let token = AuthService::generate_token(user.id, user.email.clone())
+        .map_err(|e| ApiError::Internal(e))?;
+
+    let user_response = user_to_response(&user);
+
+    Ok(Json(AuthResponse {
+        token,
+        user: user_response,
+    }))
+}
+
+// Admin stats endpoint
+#[utoipa::path(
+    get,
+    path = "/api/admin/stats",
+    responses(
+        (status = 200, description = "Admin statistics", body = AdminStatsResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "admin",
+)]
+pub async fn admin_stats(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<AdminStatsResponse>, ApiError> {
+    verify_admin(&headers, &state).await?;
+
+    let total_users = state.db.get_total_users_count().await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let (total_payments, total_completed_payments, total_revenue_cents) = 
+        state.db.get_payment_stats().await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let total_credits_purchased = state.db.get_total_credits_purchased().await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let total_credits_used = state.db.get_total_credits_used().await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let total_jobs = state.db.get_total_jobs_count().await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(AdminStatsResponse {
+        total_users,
+        total_payments,
+        total_completed_payments,
+        total_revenue_usd: total_revenue_cents / 100.0,
+        total_credits_purchased,
+        total_credits_used,
+        total_jobs,
+    }))
+}
+
+// Admin list users endpoint
+#[utoipa::path(
+    get,
+    path = "/api/admin/users",
+    params(
+        ("limit" = Option<i64>, Query, description = "Limit number of users (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+    ),
+    responses(
+        (status = 200, description = "List of users", body = AdminUsersListResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "admin",
+)]
+pub async fn admin_list_users(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<AdminUsersListResponse>, ApiError> {
+    verify_admin(&headers, &state).await?;
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(50)
+        .min(100); // Max 100 per page
+
+    let offset = params
+        .get("offset")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let users = state.db.get_all_users(limit, offset).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let total = state.db.get_total_users_count().await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let user_responses: Vec<AdminUserResponse> = users
+        .into_iter()
+        .map(|u| AdminUserResponse {
+            id: u.id,
+            name: u.name.clone(),
+            email: u.email.clone(),
+            credits: u.credits,
+            avatar_url: u.avatar_url.clone(),
+            auth_provider: if u.google_id.is_some() {
+                "google".to_string()
+            } else {
+                "password".to_string()
+            },
+            email_verified: u.email_verified,
+            is_admin: u.is_admin,
+            created_at: u.created_at.to_rfc3339(),
+            updated_at: u.updated_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(AdminUsersListResponse {
+        total,
+        users: user_responses,
+    }))
+}
+
+// Admin get user details endpoint
+#[utoipa::path(
+    get,
+    path = "/api/admin/users/{user_id}",
+    params(
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    responses(
+        (status = 200, description = "User details", body = AdminUserResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "admin",
+)]
+pub async fn admin_get_user(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<AdminUserResponse>, ApiError> {
+    verify_admin(&headers, &state).await?;
+
+    let user = state.db.get_user_by_id(user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    Ok(Json(AdminUserResponse {
+        id: user.id,
+        name: user.name.clone(),
+        email: user.email.clone(),
+        credits: user.credits,
+        avatar_url: user.avatar_url.clone(),
+        auth_provider: if user.google_id.is_some() {
+            "google".to_string()
+        } else {
+            "password".to_string()
+        },
+        email_verified: user.email_verified,
+        is_admin: user.is_admin,
+        created_at: user.created_at.to_rfc3339(),
+        updated_at: user.updated_at.to_rfc3339(),
+    }))
+}
+
+// Admin list payments endpoint
+#[utoipa::path(
+    get,
+    path = "/api/admin/payments",
+    params(
+        ("limit" = Option<i64>, Query, description = "Limit number of payments (default: 50)"),
+        ("offset" = Option<i64>, Query, description = "Offset for pagination (default: 0)"),
+    ),
+    responses(
+        (status = 200, description = "List of payments", body = AdminPaymentsListResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "admin",
+)]
+pub async fn admin_list_payments(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<AdminPaymentsListResponse>, ApiError> {
+    verify_admin(&headers, &state).await?;
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(50)
+        .min(100); // Max 100 per page
+
+    let offset = params
+        .get("offset")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+
+    let payments = state.db.get_all_payments(limit, offset).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    let payment_responses: Vec<serde_json::Value> = payments
+        .into_iter()
+        .map(|p| serde_json::json!({
+            "id": p.id,
+            "user_id": p.user_id,
+            "stripe_payment_intent_id": p.stripe_payment_intent_id,
+            "stripe_checkout_session_id": p.stripe_checkout_session_id,
+            "amount_cents": p.amount_cents,
+            "amount_usd": p.amount_cents as f64 / 100.0,
+            "credits": p.credits,
+            "status": p.status,
+            "currency": p.currency,
+            "created_at": p.created_at.to_rfc3339(),
+            "updated_at": p.updated_at.to_rfc3339(),
+        }))
+        .collect();
+
+    Ok(Json(AdminPaymentsListResponse {
+        total: payment_responses.len(),
+        payments: payment_responses,
+    }))
+}
+
+// Admin update user admin status endpoint
+#[utoipa::path(
+    patch,
+    path = "/api/admin/users/{user_id}/admin-status",
+    params(
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    request_body = UpdateUserAdminStatusRequest,
+    responses(
+        (status = 200, description = "Admin status updated"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "admin",
+)]
+pub async fn admin_update_user_admin_status(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<UpdateUserAdminStatusRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify_admin(&headers, &state).await?;
+
+    // Verify user exists
+    state.db.get_user_by_id(user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    state.db.update_user_admin_status(user_id, request.is_admin).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "message": format!("User admin status updated to {}", request.is_admin),
+        "user_id": user_id,
+        "is_admin": request.is_admin,
+    })))
+}
+
+// Admin update user credits endpoint
+#[utoipa::path(
+    patch,
+    path = "/api/admin/users/{user_id}/credits",
+    params(
+        ("user_id" = Uuid, Path, description = "User ID")
+    ),
+    request_body = UpdateUserCreditsRequest,
+    responses(
+        (status = 200, description = "User credits updated"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found"),
+    ),
+    security(
+        ("bearer" = [])
+    ),
+    tag = "admin",
+)]
+pub async fn admin_update_user_credits(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Json(request): Json<UpdateUserCreditsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    verify_admin(&headers, &state).await?;
+
+    if let Err(validation_errors) = request.validate() {
+        return Err(ApiError::Validation(format!("{}", validation_errors)));
+    }
+
+    // Verify user exists
+    state.db.get_user_by_id(user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| ApiError::UserNotFound)?;
+
+    state.db.admin_update_user_credits(user_id, request.credits).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "message": format!("User credits updated to {}", request.credits),
+        "user_id": user_id,
+        "credits": request.credits,
+    })))
+}
+
 #[utoipa::path(
     get,
     path = "/health",
@@ -1828,6 +2268,13 @@ async fn main() {
             get_job_status,
             get_job_results,
             delete_job,
+            admin_login,
+            admin_stats,
+            admin_list_users,
+            admin_get_user,
+            admin_list_payments,
+            admin_update_user_admin_status,
+            admin_update_user_credits,
         ),
         components(schemas(
             SignUpRequest,
@@ -1854,6 +2301,13 @@ async fn main() {
             JobStatus,
             ListJobsResponse,
             JobSummary,
+            AdminLoginRequest,
+            AdminUserResponse,
+            AdminStatsResponse,
+            AdminUsersListResponse,
+            AdminPaymentsListResponse,
+            UpdateUserAdminStatusRequest,
+            UpdateUserCreditsRequest,
         )),
         tags(
             (name = "health", description = "Health check endpoints"),
@@ -1862,6 +2316,7 @@ async fn main() {
             (name = "api-keys", description = "API key management endpoints"),
             (name = "scraping", description = "Web scraping endpoints"),
             (name = "jobs", description = "Job management endpoints"),
+            (name = "admin", description = "Admin management endpoints"),
         ),
         modifiers(&SecurityAddon)
     )]
@@ -1913,12 +2368,27 @@ async fn main() {
             RateLimitLayer::rate_limit_middleware(general_rate_limit.limiter().clone(), req, next)
         }));
 
+    // Admin routes with stricter rate limiting
+    let admin_rate_limit = RateLimitLayer::new(20, std::time::Duration::from_secs(60));
+    let admin_routes = Router::new()
+        .route("/api/admin/login", post(admin_login))
+        .route("/api/admin/stats", get(admin_stats))
+        .route("/api/admin/users", get(admin_list_users))
+        .route("/api/admin/users/:user_id", get(admin_get_user))
+        .route("/api/admin/users/:user_id/admin-status", axum::routing::patch(admin_update_user_admin_status))
+        .route("/api/admin/users/:user_id/credits", axum::routing::patch(admin_update_user_credits))
+        .route("/api/admin/payments", get(admin_list_payments))
+        .layer(middleware::from_fn(move |req, next| {
+            RateLimitLayer::rate_limit_middleware(admin_rate_limit.limiter().clone(), req, next)
+        }));
+
     let app = Router::new()
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health_check))
         .merge(auth_routes)
         .merge(api_routes)
         .merge(general_routes)
+        .merge(admin_routes)
         // Webhook routes (no rate limiting, no auth)
         .route("/api/webhooks/stripe", post(stripe_webhook))
         .layer(CorsLayer::permissive())
@@ -1947,6 +2417,14 @@ async fn main() {
     println!("  DELETE /api/jobs/:job_id        - Delete job");
     println!("\n🔑 API Key Protected:");
     println!("  POST /api/v1/scrape             - Start scraping (uses X-API-Key header)");
+    println!("\n👑 Admin Endpoints (Bearer Token, Admin Only):");
+    println!("  POST /api/admin/login           - Admin login");
+    println!("  GET  /api/admin/stats           - Get admin statistics");
+    println!("  GET  /api/admin/users           - List all users");
+    println!("  GET  /api/admin/users/:id       - Get user details");
+    println!("  PATCH /api/admin/users/:id/admin-status - Update user admin status");
+    println!("  PATCH /api/admin/users/:id/credits - Update user credits");
+    println!("  GET  /api/admin/payments        - List all payments");
     println!("\n📖 Example Usage:");
     println!("  # Sign up:");
     println!("  curl -X POST http://localhost:3001/api/auth/signup \\");
