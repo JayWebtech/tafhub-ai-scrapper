@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use url::Url;
 use utoipa::ToSchema;
 
@@ -65,9 +65,13 @@ pub struct WebScraper {
 
 impl WebScraper {
     pub fn new(config: ScraperConfig) -> Result<Self, ScraperError> {
+        // Use a realistic browser User-Agent to avoid bot detection
+        let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        
         let client = Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; RustScraper/1.0)")
+            .user_agent(user_agent)
             .timeout(Duration::from_secs(30))
+            .danger_accept_invalid_certs(false) // Keep SSL verification
             .build()?;
 
         Ok(Self {
@@ -138,25 +142,73 @@ impl WebScraper {
     async fn scrape_page(&self, url: &str) -> Result<ScrapedData, ScraperError> {
         info!("Scraping page: {}", url);
 
-        let response = self.client.get(url).send().await?;
+        // Build request with realistic browser headers
+        let response = self.client
+            .get(url)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("DNT", "1")
+            .header("Connection", "keep-alive")
+            .header("Upgrade-Insecure-Requests", "1")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
+            .header("Cache-Control", "max-age=0")
+            .send()
+            .await?;
         
-        if !response.status().is_success() {
+        let status = response.status();
+        info!("Response status for {}: {}", url, status);
+        
+        if !status.is_success() {
             return Err(ScraperError::Selector(format!(
                 "HTTP error: {} for URL: {}",
-                response.status(),
+                status,
                 url
             )));
         }
 
         let body = response.text().await?;
+        let body_length = body.len();
+        info!("Received {} bytes from {}", body_length, url);
+        
+        // Log first 500 chars for debugging
+        if body_length > 0 {
+            let preview = body.chars().take(500).collect::<String>();
+            info!("Body preview (first 500 chars): {}", preview);
+        } else {
+            warn!("Empty response body from {}", url);
+        }
+
         let document = Html::parse_document(&body);
+
+        let title = self.extract_title(&document);
+        let links = self.extract_links(&document, url)?;
+        let text_content = self.extract_text_content(&document);
+        let images = self.extract_images(&document, url)?;
+
+        info!("Extracted from {}: title={:?}, links={}, text_blocks={}, images={}", 
+            url, 
+            title.is_some(), 
+            links.len(), 
+            text_content.len(), 
+            images.len()
+        );
+
+        // Check if we got meaningful content
+        if text_content.is_empty() && links.is_empty() && images.is_empty() {
+            warn!("No content extracted from {} - page might be JavaScript-rendered, blocked, or have anti-bot protection", url);
+            warn!("Consider: 1) Website requires JavaScript rendering (needs headless browser), 2) Anti-bot protection, 3) Rate limiting");
+        }
 
         let data = ScrapedData {
             url: url.to_string(),
-            title: self.extract_title(&document),
-            links: self.extract_links(&document, url)?,
-            text_content: self.extract_text_content(&document),
-            images: self.extract_images(&document, url)?,
+            title,
+            links,
+            text_content,
+            images,
         };
 
         Ok(data)
@@ -192,20 +244,61 @@ impl WebScraper {
     }
 
     fn extract_text_content(&self, document: &Html) -> Vec<String> {
+        // Expanded selectors for better content extraction
         let content_selectors = [
-            "p", "h1", "h2", "h3", "h4", "h5", "h6", 
-            "article", "main", ".content", "#content"
+            // Common content containers
+            "article", "main", "section", ".content", "#content",
+            // Text elements
+            "p", "h1", "h2", "h3", "h4", "h5", "h6",
+            // E-commerce specific
+            ".product", ".product-title", ".product-description",
+            ".item", ".listing", ".card", ".card-body",
+            // Generic content classes
+            ".text", ".description", ".summary", ".details",
+            // List items
+            "li", ".list-item",
+            // Divs with common content classes
+            "div.content", "div.text", "div.description",
         ];
 
         let mut text_content = Vec::new();
+        let mut seen_text = HashSet::new(); // Avoid duplicates
 
         for selector_str in &content_selectors {
             if let Ok(selector) = Selector::parse(selector_str) {
                 for element in document.select(&selector) {
                     let text = element.text().collect::<Vec<_>>().join(" ");
                     let cleaned_text = text.trim().to_string();
-                    if !cleaned_text.is_empty() && cleaned_text.len() > 10 {
-                        text_content.push(cleaned_text);
+                    
+                    // Filter out very short or duplicate text
+                    if !cleaned_text.is_empty() 
+                        && cleaned_text.len() > 10 
+                        && !seen_text.contains(&cleaned_text) {
+                        text_content.push(cleaned_text.clone());
+                        seen_text.insert(cleaned_text);
+                    }
+                }
+            }
+        }
+
+        // If we still don't have content, try extracting from body directly
+        if text_content.is_empty() {
+            let body_selector = Selector::parse("body").ok();
+            if let Some(selector) = body_selector {
+                for element in document.select(&selector) {
+                    let text = element.text().collect::<Vec<_>>().join(" ");
+                    let cleaned_text = text.trim().to_string();
+                    
+                    // Split into sentences/paragraphs
+                    for sentence in cleaned_text.split(&['.', '!', '?', '\n'][..]) {
+                        let sentence = sentence.trim().to_string();
+                        if sentence.len() > 20 && !seen_text.contains(&sentence) {
+                            text_content.push(sentence.clone());
+                            seen_text.insert(sentence);
+                            if text_content.len() >= 50 { // Limit fallback extraction
+                                break;
+                            }
+                        }
                     }
                 }
             }
