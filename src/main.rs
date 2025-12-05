@@ -1445,36 +1445,7 @@ pub async fn start_scraping(
     state.db.update_api_key_last_used(api_key_info.id).await
         .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
 
-    const CACHE_HOURS: i64 = 24;
-    match state.db.get_cached_url(&request.url, CACHE_HOURS).await {
-        Ok(Some((cached_job_id, cached_data))) => {
-            info!("Returning cached data for URL: {} (job: {})", request.url, cached_job_id);
-            return Ok(Json(ScrapeResponse {
-                job_id: cached_job_id,
-                status: "completed".to_string(),
-                message: format!("Data served from cache for URL: {}", request.url),
-                cached: true,
-                data: Some(cached_data),
-            }));
-        }
-        Ok(None) => {
-            info!("No cached data found for URL: {}, will scrape fresh", request.url);
-        }
-        Err(e) => {
-            warn!("Cache check failed for URL {}: {}, proceeding with fresh scrape", request.url, e);
-        }
-    }
-
-    let has_credits = state.db.deduct_credit(api_key_info.user_id).await
-        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
-
-    if !has_credits {
-        return Err(ApiError::InsufficientCredits);
-    }
-
-    let job_id = Uuid::new_v4();
-    info!("Starting scrape job {} for URL: {} (user: {})", job_id, request.url, api_key_info.user_id);
-
+    // Build scraper config first (needed for cache lookup)
     let scraper_config = match request.config {
         Some(config) => ScraperConfig {
             max_pages: config.max_pages.min(100), // Cap at 100 pages for API
@@ -1493,6 +1464,57 @@ pub async fn start_scraping(
             respect_robots_txt: true,
         },
     };
+
+    // Check cache with configuration parameters
+    const CACHE_HOURS: i64 = 24;
+    match state.db.get_cached_url(
+        &request.url,
+        CACHE_HOURS,
+        scraper_config.max_pages as i32,
+        scraper_config.max_depth as i32,
+        scraper_config.delay_ms as i32,
+        scraper_config.follow_external_links,
+    ).await {
+        Ok(Some((cached_job_id, cached_data))) => {
+            info!("Returning cached data for URL: {} with config (pages: {}, depth: {}, delay: {}ms, external: {}) (job: {})", 
+                request.url, 
+                scraper_config.max_pages,
+                scraper_config.max_depth,
+                scraper_config.delay_ms,
+                scraper_config.follow_external_links,
+                cached_job_id
+            );
+            return Ok(Json(ScrapeResponse {
+                job_id: cached_job_id,
+                status: "completed".to_string(),
+                message: format!("Data served from cache for URL: {} with matching configuration", request.url),
+                cached: true,
+                data: Some(cached_data),
+            }));
+        }
+        Ok(None) => {
+            info!("No cached data found for URL: {} with config (pages: {}, depth: {}, delay: {}ms, external: {}), will scrape fresh", 
+                request.url,
+                scraper_config.max_pages,
+                scraper_config.max_depth,
+                scraper_config.delay_ms,
+                scraper_config.follow_external_links
+            );
+        }
+        Err(e) => {
+            warn!("Cache check failed for URL {}: {}, proceeding with fresh scrape", request.url, e);
+        }
+    }
+
+    let has_credits = state.db.deduct_credit(api_key_info.user_id).await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+    if !has_credits {
+        return Err(ApiError::InsufficientCredits);
+    }
+
+    let job_id = Uuid::new_v4();
+    info!("Starting scrape job {} for URL: {} (user: {})", job_id, request.url, api_key_info.user_id);
 
     // Store job in database
     info!("Creating job {} in database", job_id);

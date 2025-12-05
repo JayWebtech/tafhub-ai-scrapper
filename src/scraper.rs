@@ -65,13 +65,9 @@ pub struct WebScraper {
 
 impl WebScraper {
     pub fn new(config: ScraperConfig) -> Result<Self, ScraperError> {
-        // Use a realistic browser User-Agent to avoid bot detection
-        let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-        
         let client = Client::builder()
-            .user_agent(user_agent)
+            .user_agent("Mozilla/5.0 (compatible; RustScraper/1.0)")
             .timeout(Duration::from_secs(30))
-            .cookie_store(true) // Enable cookie storage for session handling
             .build()?;
 
         Ok(Self {
@@ -142,96 +138,17 @@ impl WebScraper {
     async fn scrape_page(&self, url: &str) -> Result<ScrapedData, ScraperError> {
         info!("Scraping page: {}", url);
 
-        // Parse URL to extract domain for referer
-        let parsed_url = Url::parse(url)?;
-        let base_domain = format!("{}://{}", parsed_url.scheme(), parsed_url.host_str().unwrap_or(""));
-
-        // Build request with browser-like headers to avoid bot detection
-        let response = self.client
-            .get(url)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Accept-Encoding", "gzip, deflate, br")
-            .header("Referer", &base_domain)
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Site", "same-origin")
-            .header("Sec-Ch-Ua", r#""Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120""#)
-            .header("Sec-Ch-Ua-Mobile", "?0")
-            .header("Sec-Ch-Ua-Platform", r#""Windows""#)
-            .header("Upgrade-Insecure-Requests", "1")
-            .header("Connection", "keep-alive")
-            .header("Cache-Control", "max-age=0")
-            .send()
-            .await?;
+        let response = self.client.get(url).send().await?;
         
-        let status = response.status();
-        if !status.is_success() {
-            // Log response body for debugging if available
-            let error_body = response.text().await.unwrap_or_default();
-            let error_preview = if error_body.len() > 500 {
-                format!("{}...", &error_body[..500])
-            } else {
-                error_body
-            };
-            
+        if !response.status().is_success() {
             return Err(ScraperError::Selector(format!(
-                "HTTP error: {} for URL: {}\nResponse preview: {}",
-                status,
-                url,
-                error_preview
+                "HTTP error: {} for URL: {}",
+                response.status(),
+                url
             )));
         }
 
         let body = response.text().await?;
-        
-        // Log response size for debugging
-        info!("Response size for {}: {} bytes", url, body.len());
-        
-        // Check if response is empty or suspiciously small (might be a block page)
-        if body.trim().is_empty() {
-            error!("Empty response body for URL: {}. Site may be blocking the request.", url);
-            return Err(ScraperError::Selector(format!(
-                "Empty response body for URL: {}. Site may be blocking the request. This could indicate:\n\
-                - Bot detection/anti-scraping measures\n\
-                - JavaScript-rendered content (SPA sites)\n\
-                - Rate limiting or IP blocking\n\
-                - Invalid or blocked User-Agent",
-                url
-            )));
-        }
-        
-        // Check for common bot detection indicators in the HTML
-        let body_lower = body.to_lowercase();
-        let blocking_indicators = [
-            ("access denied", "Access denied page detected"),
-            ("blocked", "Blocking page detected"),
-            ("cloudflare", "Cloudflare protection detected"),
-            ("checking your browser", "Cloudflare browser check detected"),
-            ("please enable javascript", "JavaScript required - site may be SPA"),
-            ("captcha", "CAPTCHA challenge detected"),
-            ("forbidden", "403 Forbidden response"),
-        ];
-        
-        for (indicator, message) in &blocking_indicators {
-            if body_lower.contains(indicator) {
-                error!("{} for URL: {}", message, url);
-                return Err(ScraperError::Selector(format!(
-                    "{} for URL: {}\n\
-                    This site may require:\n\
-                    - JavaScript execution (SPA/React sites)\n\
-                    - CAPTCHA solving\n\
-                    - Additional verification steps\n\
-                    - Browser fingerprinting\n\
-                    \n\
-                    Note: This scraper only handles static HTML. JavaScript-rendered content \
-                    requires a headless browser like Puppeteer or Playwright.",
-                    message,
-                    url
-                )));
-            }
-        }
-        
         let document = Html::parse_document(&body);
 
         let data = ScrapedData {

@@ -855,6 +855,10 @@ impl Database {
         &self,
         url: &str,
         cache_hours: i64,
+        max_pages: i32,
+        max_depth: i32,
+        delay_ms: i32,
+        follow_external_links: bool,
     ) -> Result<Option<(Uuid, Vec<ScrapedData>)>, sqlx::Error> {
         let url_hash = Self::normalize_and_hash_url(url);
         
@@ -883,11 +887,18 @@ impl Database {
             // Commit transaction before fetching data (to avoid long locks)
             tx.commit().await?;
             
-            // Verify job is completed
+            // Verify job is completed and has matching configuration
             let job = self.get_job(job_id).await?
                 .ok_or_else(|| sqlx::Error::RowNotFound)?;
             
-            if job.status == "completed" {
+            // Check if job configuration matches the requested configuration
+            let config_matches = job.status == "completed"
+                && job.max_pages == max_pages
+                && job.max_depth == max_depth
+                && job.delay_ms == delay_ms
+                && job.follow_external_links == follow_external_links;
+            
+            if config_matches {
                 // Get the scraped data for this job
                 let scraped_data = self.get_scraped_data(job_id).await?;
                 
@@ -897,6 +908,7 @@ impl Database {
                     None
                 }
             } else {
+                // Configuration doesn't match, return None to trigger fresh scrape
                 None
             }
         } else {
